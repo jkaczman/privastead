@@ -35,6 +35,7 @@ const NUM_RANDOM_CHARS: u8 = 16;
 
 // Used to ensure there can't be attempted concurrent pairing
 static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+const HOTSPOT_CONNECTION_NAME: &str = "Hotspot";
 
 fn write_varying_len(stream: &mut TcpStream, msg: &[u8]) -> io::Result<()> {
     // FIXME: is u64 necessary?
@@ -234,21 +235,71 @@ fn nmcli_stdout(args: &[&str]) -> io::Result<String> {
     Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
 }
 
-fn active_wifi_device() -> io::Result<Option<String>> {
-    // nmcli -t gives colon-separated output and -f limits the fields.
-    // We only need device/type/state here
-    let output = nmcli_stdout(&["-t", "-f", "DEVICE,TYPE,STATE", "device", "status"])?;
+fn ensure_command_success(output: Output, context: &str) -> io::Result<Output> {
+    // NetworkManager failures here change pairing state, so do not silently ignore them.
+    if output.status.success() {
+        return Ok(output);
+    }
+
+    let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+    Err(io::Error::other(format!("{context}: {stderr}")))
+}
+
+fn active_connections() -> io::Result<Vec<(String, String, String)>> {
+    // Read the active profile list once so readiness checks reason about the same NM view.
+    let output = nmcli_stdout(&["-t", "-f", "NAME,TYPE,DEVICE", "connection", "show", "--active"])?;
+    let mut active = Vec::new();
     for line in output.lines() {
-        let mut parts = line.split(':');
-        let device = parts.next().unwrap_or_default();
-        let kind = parts.next().unwrap_or_default();
-        let state = parts.next().unwrap_or_default();
-        if kind == "wifi" && (state == "connected" || state == "connecting") {
-            return Ok(Some(device.to_string()));
+        let mut parts = line.splitn(3, ':');
+        let name = parts.next().unwrap_or_default().trim();
+        let kind = parts.next().unwrap_or_default().trim();
+        let device = parts.next().unwrap_or_default().trim();
+        if !name.is_empty() && name != "lo" {
+            active.push((name.to_string(), kind.to_string(), device.to_string()));
         }
     }
 
-    Ok(None)
+    Ok(active)
+}
+
+fn active_connection_device(name: &str) -> io::Result<Option<String>> {
+    // Tie later route/IP checks to the device that actually owns the requested profile.
+    Ok(active_connections()?
+        .into_iter()
+        .find_map(|(active_name, _kind, device)| {
+            if active_name == name && !device.is_empty() && device != "--" {
+                Some(device)
+            } else {
+                None
+            }
+        }))
+}
+
+fn wifi_connection_mode(name: &str) -> io::Result<Option<String>> {
+    // AP-mode profiles are the ones that keep the camera discoverable hotspot alive.
+    let output = nmcli_stdout(&["-g", "802-11-wireless.mode", "connection", "show", name])?;
+    let mode = output.trim();
+    if mode.is_empty() {
+        return Ok(None);
+    }
+
+    Ok(Some(mode.to_string()))
+}
+
+fn active_hotspot_connection_names() -> io::Result<Vec<String>> {
+    // Detect active hotspot profiles generically instead of relying on one fixed connection name.
+    let mut names = Vec::new();
+    for (name, kind, _device) in active_connections()? {
+        if kind != "wifi" {
+            continue;
+        }
+
+        if wifi_connection_mode(&name)?.as_deref() == Some("ap") {
+            names.push(name);
+        }
+    }
+
+    Ok(names)
 }
 
 fn ssid_visible(ssid: &str) -> io::Result<bool> {
@@ -257,17 +308,12 @@ fn ssid_visible(ssid: &str) -> io::Result<bool> {
     Ok(output.lines().any(|line| line == ssid))
 }
 
-fn active_connection_name() -> io::Result<Option<String>> {
-    // Sanity check that NetworkManager thinks the active profile name is the SSID we just asked for, instead of some leftover/stale active connection.
-    let output = nmcli_stdout(&["-t", "-f", "NAME", "connection", "show", "--active"])?;
-    for line in output.lines() {
-        let name = line.trim();
-        if !name.is_empty() && name != "lo" {
-            return Ok(Some(name.to_string()));
-        }
-    }
-
-    Ok(None)
+fn active_connection_names() -> io::Result<Vec<String>> {
+    // The readiness path only cares whether the target profile is active at all.
+    Ok(active_connections()?
+        .into_iter()
+        .map(|(name, _kind, _device)| name)
+        .collect())
 }
 
 fn wifi_has_ipv4(device: &str) -> io::Result<bool> {
@@ -276,10 +322,10 @@ fn wifi_has_ipv4(device: &str) -> io::Result<bool> {
     Ok(output.lines().any(|line| !line.trim().is_empty()))
 }
 
-fn has_default_route() -> io::Result<bool> {
-    // We also need a default route (in addition to the IP), otherwise the relay/server request can still fail even though the Wi-Fi join looked successful
+fn has_default_route(device: &str) -> io::Result<bool> {
+    // We also need a default route on the joined Wi-Fi device itself, otherwise the relay/server request can still fail even though some other interface kept the box online.
     let output = Command::new("ip")
-        .args(["route", "show", "default"])
+        .args(["route", "show", "default", "dev", device])
         .output()?;
     Ok(!String::from_utf8_lossy(&output.stdout).trim().is_empty())
 }
@@ -334,15 +380,24 @@ fn wait_for_wifi_readiness(ssid: &str, server_addr: &str, timeout: Duration) -> 
     while start.elapsed() < timeout {
         // Checks are intentionally split out one by one. Allows logs to show
         // what layer is lagging: wrong active connection, no device yet, no DHCP yet, no route yet, or no relay reachability yet...
-        let active_name = active_connection_name()?;
-        if active_name.as_deref() != Some(ssid) {
-            last_reason = format!("active connection is {:?}, expected {}", active_name, ssid);
+        let active_names = active_connection_names()?;
+        if !active_names.iter().any(|name| name == ssid) {
+            last_reason = format!("active connections are {:?}, expected {}", active_names, ssid);
             thread::sleep(Duration::from_millis(500));
             continue;
         }
 
-        let Some(device) = active_wifi_device()? else {
-            last_reason = "no active wifi device".to_string();
+        // A successful join is not enough if the hotspot profile never actually went away.
+        let hotspot_names = active_hotspot_connection_names()?;
+        if !hotspot_names.is_empty() {
+            last_reason = format!("hotspot connection(s) still active: {:?}", hotspot_names);
+            thread::sleep(Duration::from_millis(500));
+            continue;
+        }
+
+        // Use the concrete device behind this SSID so later checks are not satisfied by the wrong interface.
+        let Some(device) = active_connection_device(ssid)? else {
+            last_reason = format!("SSID '{ssid}' has no active device yet");
             thread::sleep(Duration::from_millis(500));
             continue;
         };
@@ -353,8 +408,8 @@ fn wait_for_wifi_readiness(ssid: &str, server_addr: &str, timeout: Duration) -> 
             continue;
         }
 
-        if !has_default_route()? {
-            last_reason = "default route not ready yet".to_string();
+        if !has_default_route(&device)? {
+            last_reason = format!("default route not ready yet on device {device}");
             thread::sleep(Duration::from_millis(500));
             continue;
         }
@@ -373,6 +428,21 @@ fn wait_for_wifi_readiness(ssid: &str, server_addr: &str, timeout: Duration) -> 
         io::ErrorKind::TimedOut,
         format!("Timed out waiting for Wi-Fi readiness: {last_reason}"),
     ))
+}
+
+fn wait_for_hotspot_shutdown(timeout: Duration) -> io::Result<()> {
+    // NetworkManager can report the connect succeeded before it has fully torn AP mode down.
+    let start = std::time::Instant::now();
+    while start.elapsed() < timeout {
+        let hotspot_names = active_hotspot_connection_names()?;
+        if hotspot_names.is_empty() {
+            return Ok(());
+        }
+
+        thread::sleep(Duration::from_millis(500));
+    }
+
+    Err(io::Error::other("Timed out waiting for hotspot to shut down"))
 }
 
 fn wait_for_ssid_visibility(ssid: &str, timeout: Duration) -> io::Result<()> {
@@ -396,11 +466,31 @@ fn attempt_wifi_connection(ssid: String, password: String, server_addr: &str) ->
 
     // First get out of hotspot mode cleanly so NetworkManager is not juggling both flows at once.
     // We still leave ourselves a path to bring the hotspot back if pairing fails.
-    let _ = Command::new("nmcli")
-        .args(["connection", "down", "id", "Hotspot"])
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .output()?; // wait for shutdown
+    // Drop every active AP profile first so pairing does not "succeed" with the hotspot still running.
+    for hotspot_name in active_hotspot_connection_names()? {
+        let output = Command::new("nmcli")
+            .args(["connection", "down", "id", hotspot_name.as_str()])
+            .output()?; // wait for shutdown
+        ensure_command_success(
+            output,
+            &format!("Failed to bring hotspot connection '{hotspot_name}' down"),
+        )?;
+    }
+
+    // Keep one fallback for older setups that still expect the canonical Hotspot profile name.
+    if let Err(e) = wait_for_hotspot_shutdown(Duration::from_secs(8)) {
+        let fallback_output = Command::new("nmcli")
+            .args(["connection", "down", "id", HOTSPOT_CONNECTION_NAME])
+            .output()?;
+        if fallback_output.status.success() {
+            wait_for_hotspot_shutdown(Duration::from_secs(8))?;
+        } else {
+            return Err(io::Error::other(format!(
+                "{e}; fallback shutdown of '{HOTSPOT_CONNECTION_NAME}' also failed: {}",
+                String::from_utf8_lossy(&fallback_output.stderr).trim()
+            )));
+        }
+    }
 
     // Keep a short buffer after leaving hotspot mode so NetworkManager can settle before
     // we kick off scans/connect attempts.
@@ -484,11 +574,10 @@ fn attempt_wifi_connection(ssid: String, password: String, server_addr: &str) ->
 fn bring_hotspot_back_up() -> io::Result<()> {
     debug!("[Pairing] Bringing hotspot back up...");
     // If pairing fails, we want the device to recover back into the discoverable state
-    Command::new("nmcli")
+    let output = Command::new("nmcli")
         .args(["connection", "up", "id", "Hotspot"])
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
         .output()?;
+    ensure_command_success(output, "Failed to bring hotspot back up")?;
     Ok(())
 }
 
