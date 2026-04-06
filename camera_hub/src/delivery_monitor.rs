@@ -210,6 +210,8 @@ impl DeliveryMonitor {
         self.save_state();
     }
 
+    // TODO: Keeping these three functions here since we might need them.
+    /*
     pub fn get_all_pending_video_timestamps(&self) -> Vec<u64> {
         self.video_pending_list
             .values()
@@ -227,6 +229,7 @@ impl DeliveryMonitor {
     pub fn get_thumbnail_meta_by_timestamp(&self, timestamp: &u64) -> &ThumbnailMetaInfo {
         self.thumbnail_pending_list.get(timestamp).unwrap()
     }
+    */
 
     pub fn videos_to_send(&self) -> Vec<VideoInfo> {
         let mut send_list: Vec<VideoInfo> = Vec::new();

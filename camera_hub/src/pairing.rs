@@ -856,12 +856,11 @@ pub fn pair_all(
 }
 
 pub fn get_names(
-    camera: &dyn Camera,
+    state_dir: String,
     first_time: bool,
     camera_filename: String,
     group_filename: String,
 ) -> (String, String) {
-    let state_dir = camera.get_state_dir();
     let state_dir_path = Path::new(&state_dir);
     let camera_path = state_dir_path.join(camera_filename);
     let group_path = state_dir_path.join(group_filename);

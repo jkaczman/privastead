@@ -3,16 +3,12 @@
 //! SPDX-License-Identifier: GPL-3.0-or-later
 
 use crate::delivery_monitor::{DeliveryMonitor, VideoInfo};
-use crate::notification_target::send_notification;
-use crate::traits::Camera;
 use image::RgbImage;
-use regex::Regex;
 use secluso_client_lib::http_client::HttpClient;
 use secluso_client_lib::mls_client::MlsClient;
-use secluso_client_lib::mls_clients::{MlsClients, FCM, MAX_OFFLINE_WINDOW, MOTION, THUMBNAIL};
+use secluso_client_lib::mls_clients::{MAX_OFFLINE_WINDOW};
 use secluso_client_lib::thumbnail_meta_info::{GeneralDetectionType, ThumbnailMetaInfo};
 use secluso_client_lib::video::{encrypt_thumbnail_file, encrypt_video_file};
-use std::fs;
 use std::io;
 
 // Used to contain data returned from motion detection from IP + Raspberry cameras
@@ -26,12 +22,13 @@ pub fn upload_pending_enc_thumbnails(
     group_name: &str,
     delivery_monitor: &mut DeliveryMonitor,
     http_client: &HttpClient,
+    num_apps: u32,
 ) -> io::Result<()> {
     // Send pending thumbnails
     let send_list_thumbnails: Vec<ThumbnailMetaInfo> = delivery_monitor.thumbnails_to_send();
     if let Some(enc_thumbnail) = send_list_thumbnails.first() {
         let enc_video_file_path = delivery_monitor.get_enc_thumbnail_file_path(enc_thumbnail);
-        match http_client.upload_enc_file(group_name, &enc_video_file_path) {
+        match http_client.upload_enc_file(group_name, &enc_video_file_path, num_apps) {
             Ok(_) => {
                 info!(
                     "Thumbnail (epoch #{}) successfully uploaded to the server.",
@@ -57,13 +54,14 @@ pub fn upload_pending_enc_videos(
     group_name: &str,
     delivery_monitor: &mut DeliveryMonitor,
     http_client: &HttpClient,
+    num_apps: u32,
 ) -> io::Result<()> {
     // Send pending videos
     let send_list_videos = delivery_monitor.videos_to_send();
     // The send list is sorted. We must send the videos in order.
     if let Some(video_info) = send_list_videos.first() {
         let enc_video_file_path = delivery_monitor.get_enc_video_file_path(video_info);
-        match http_client.upload_enc_file(group_name, &enc_video_file_path) {
+        match http_client.upload_enc_file(group_name, &enc_video_file_path, num_apps) {
             Ok(_) => {
                 info!(
                     "Video {} successfully uploaded to the server.",
@@ -171,13 +169,16 @@ pub fn prepare_motion_video(
     Ok(())
 }
 
+// TODO: Keeping these two functions here since we might need them.
+/*
 pub fn send_pending_motion_videos(
     camera: &mut dyn Camera,
-    clients: &mut MlsClients,
+    clients_com: &mut MlsClientsCommon,
     delivery_monitor: &mut DeliveryMonitor,
     http_client: &HttpClient,
+    num_apps: u32,
 ) -> io::Result<()> {
-    if clients[MOTION].offline_period() > MAX_OFFLINE_WINDOW {
+    if clients_com[MOTION].offline_period() > MAX_OFFLINE_WINDOW {
         info!("App has been offline for too long. Won't send any more videos until there is a heartbeat.");
         // FIXME: not enforcing this yet.
         //return Ok(());
@@ -213,12 +214,13 @@ pub fn send_pending_motion_videos(
 
         println!("Recovered pending video {:?}", *timestamp);
         let video_info = VideoInfo::from(*timestamp);
-        prepare_motion_video(&mut clients[MOTION], video_info, delivery_monitor)?;
+        prepare_motion_video(&mut clients_com[MOTION], video_info, delivery_monitor)?;
 
         let _ = upload_pending_enc_videos(
-            &clients[MOTION].get_group_name().unwrap(),
+            &clients_com[MOTION].get_group_name().unwrap(),
             delivery_monitor,
             http_client,
+            num_apps,
         );
 
         num_recovered += 1;
@@ -228,8 +230,8 @@ pub fn send_pending_motion_videos(
         //Timestamp of 0 tells the app it's time to start downloading.
         let dummy_timestamp: u64 = 0;
         let notification_msg =
-            clients[FCM].encrypt(&bincode::serialize(&dummy_timestamp).unwrap())?;
-        clients[FCM].save_group_state().unwrap();
+            clients_com[FCM].encrypt(&bincode::serialize(&dummy_timestamp).unwrap())?;
+        clients_com[FCM].save_group_state().unwrap();
         send_notification(&camera.get_state_dir(), http_client, notification_msg)?;
     }
 
@@ -238,11 +240,12 @@ pub fn send_pending_motion_videos(
 
 pub fn send_pending_thumbnails(
     camera: &mut dyn Camera,
-    clients: &mut MlsClients,
+    clients_com: &mut MlsClientsCommon,
     delivery_monitor: &mut DeliveryMonitor,
     http_client: &HttpClient,
+    num_apps: u32,
 ) -> io::Result<()> {
-    if clients[THUMBNAIL].offline_period() > MAX_OFFLINE_WINDOW {
+    if clients_com[THUMBNAIL].offline_period() > MAX_OFFLINE_WINDOW {
         info!("App has been offline for too long. Won't send any more videos until there is a heartbeat.");
         // FIXME: not enforcing this yet.
         //return Ok(());
@@ -282,15 +285,16 @@ pub fn send_pending_thumbnails(
 
         // We clone the thumbnail meta here, which modifies the epoch. This doesn't matter as it's re-entered into the HashMap in the DeliveryMonitor at the end.
         prepare_motion_thumbnail(
-            &mut clients[THUMBNAIL],
+            &mut clients_com[THUMBNAIL],
             thumbnail_meta.clone(),
             delivery_monitor,
         )?;
 
         let _ = upload_pending_enc_thumbnails(
-            &clients[THUMBNAIL].get_group_name().unwrap(),
+            &clients_com[THUMBNAIL].get_group_name().unwrap(),
             delivery_monitor,
             http_client,
+            num_apps,
         );
 
         num_recovered += 1;
@@ -300,10 +304,11 @@ pub fn send_pending_thumbnails(
         //Timestamp of 0 tells the app it's time to start downloading.
         let dummy_timestamp: u64 = 0;
         let notification_msg =
-            clients[FCM].encrypt(&bincode::serialize(&dummy_timestamp).unwrap())?;
-        clients[FCM].save_group_state().unwrap();
+            clients_com[FCM].encrypt(&bincode::serialize(&dummy_timestamp).unwrap())?;
+        clients_com[FCM].save_group_state().unwrap();
         send_notification(&camera.get_state_dir(), http_client, notification_msg)?;
     }
 
     Ok(())
 }
+*/

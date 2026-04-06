@@ -1145,4 +1145,315 @@ mod tests {
         // Check decrypted file
         check_decrypted_dummy_file(&dec_thumbnail_pathname, file_size);
     }
+
+    #[test]
+    /// Camera invites app.
+    /// App then sends an update proposal.
+    /// Camera receives that proposal and then sends a video.
+    fn camera_to_app_update_video_test() {
+        let (mut camera, mut app) = pair();
+
+        // App generates an update proposal
+        let update_proposal = app.update_proposal().unwrap();
+        app.save_group_state().unwrap();
+
+        // Camera receives it
+        camera.decrypt(update_proposal, false).unwrap();
+        camera.save_group_state().unwrap();
+
+        // Create input video file to be encrypted (all 0's)
+        let video_pathname = "test_data/video_file";
+        let file_size: usize = 96 * 1024 + 135;
+
+        generate_dummy_file(video_pathname, file_size);
+
+        // Camera encrypts video file
+        let enc_video_pathname = "test_data/enc_video_file";
+
+        encrypt_video_file(
+            &mut camera,
+            video_pathname,
+            enc_video_pathname,
+            0,
+        ).unwrap();
+
+        // App decrypts video file
+        fs::create_dir("test_data/app/videos").unwrap();
+
+        let dec_video_filename = decrypt_video_file(
+            &mut app,
+            enc_video_pathname,
+        ).unwrap();
+
+        let dec_video_pathname = format!("test_data/app/videos/{}", dec_video_filename);
+
+        // Check decrypted file
+        check_decrypted_dummy_file(&dec_video_pathname, file_size);
+    }
+
+    #[test]
+    /// Camera invites three apps.
+    /// It then sends a video to all of them.
+    fn camera_to_more_apps_video_test() {
+        let (mut camera, mut app) = pair();
+        let (mut app2, mut app3) = pair_with_two_more_apps(&mut camera, &mut app);
+
+        // Create input video file to be encrypted (all 0's)
+        let video_pathname = "test_data/video_file";
+        let file_size: usize = 96 * 1024 + 135;
+
+        generate_dummy_file(video_pathname, file_size);
+
+        // Camera encrypts video file
+        let enc_video_pathname = "test_data/enc_video_file";
+
+        encrypt_video_file(
+            &mut camera,
+            video_pathname,
+            enc_video_pathname,
+            0,
+        ).unwrap();
+
+        let mut apps = [
+            (&mut app, "app"),
+            (&mut app2, "app2"),
+            (&mut app3, "app3"),
+        ];
+
+        for (app, name) in apps.iter_mut() {
+            // App decrypts video file
+            let dir = format!("test_data/{}/videos", name);
+            fs::create_dir(&dir).unwrap();
+
+            let dec_video_filename = decrypt_video_file(
+                *app,
+                enc_video_pathname,
+            ).unwrap();
+
+            let dec_video_pathname = format!("{}/{}", dir, dec_video_filename);
+
+            // Check decrypted file by app
+            check_decrypted_dummy_file(&dec_video_pathname, file_size);
+        }
+    }
+
+    #[test]
+    /// Camera invites three apps.
+    /// All apps then send update proposals.
+    /// Camera receives those proposals and
+    /// then sends a video to all of them.
+    fn camera_to_more_apps_update_video_test() {
+        let (mut camera, mut app) = pair();
+        let (mut app2, mut app3) = pair_with_two_more_apps(&mut camera, &mut app);
+
+        let apps = [&mut app, &mut app2, &mut app3];
+
+        for app in apps {
+            // App generates an update proposal
+            let update_proposal = app.update_proposal().unwrap();
+            app.save_group_state().unwrap();
+
+            // Camera receives it
+            camera.decrypt(update_proposal, false).unwrap();
+            camera.save_group_state().unwrap();
+        }
+
+        // Create input video file to be encrypted (all 0's)
+        let video_pathname = "test_data/video_file";
+        let file_size: usize = 96 * 1024 + 135;
+
+        generate_dummy_file(video_pathname, file_size);
+
+        // Camera encrypts video file
+        let enc_video_pathname = "test_data/enc_video_file";
+
+        encrypt_video_file(
+            &mut camera,
+            video_pathname,
+            enc_video_pathname,
+            0,
+        ).unwrap();
+
+        let mut apps = [
+            (&mut app, "app"),
+            (&mut app2, "app2"),
+            (&mut app3, "app3"),
+        ];
+
+        for (app, name) in apps.iter_mut() {
+            // App decrypts video file
+            let dir = format!("test_data/{}/videos", name);
+            fs::create_dir(&dir).unwrap();
+
+            let dec_video_filename = decrypt_video_file(
+                *app,
+                enc_video_pathname,
+            ).unwrap();
+
+            let dec_video_pathname = format!("{}/{}", dir, dec_video_filename);
+
+            // Check decrypted file
+            check_decrypted_dummy_file(&dec_video_pathname, file_size);
+        }
+    }
+
+    #[test]
+    /// Camera invites app.
+    /// App then sends an update proposal.
+    /// Camera receives that proposal and then sends a thumbnail.
+    fn camera_to_app_update_thumbnail_test() {
+        let (mut camera, mut app) = pair();
+
+        // App generates an update proposal
+        let update_proposal = app.update_proposal().unwrap();
+        app.save_group_state().unwrap();
+
+        // Camera receives it
+        camera.decrypt(update_proposal, false).unwrap();
+        camera.save_group_state().unwrap();
+
+        // Create input thumbnail file to be encrypted (all 0's)
+        let thumbnail_pathname = "test_data/thumbnail_file";
+        let file_size: usize = 1069;
+
+        generate_dummy_file(thumbnail_pathname, file_size);
+
+        // Camera encrypts thumbnail file
+        let enc_thumbnail_pathname = "test_data/enc_thumbnail_file";
+        let mut thumbnail_info =
+                    ThumbnailMetaInfo::new(0, 0, vec![]);
+
+        encrypt_thumbnail_file(
+            &mut camera,
+            thumbnail_pathname,
+            enc_thumbnail_pathname,
+            &mut thumbnail_info,
+        ).unwrap();
+
+        // App decrypts thumbnail file
+        fs::create_dir("test_data/app/videos").unwrap();
+
+        let dec_thumbnail_filename = decrypt_thumbnail_file(
+            &mut app,
+            enc_thumbnail_pathname,
+            "test_data",
+        ).unwrap();
+
+        let dec_thumbnail_pathname = format!("test_data/app/videos/{}", dec_thumbnail_filename);
+
+        // Check decrypted file
+        check_decrypted_dummy_file(&dec_thumbnail_pathname, file_size);
+    }
+
+    #[test]
+    /// Camera invites three apps.
+    /// It then sends a thumbnail to all of them.
+    fn camera_to_more_apps_thumbnail_test() {
+        let (mut camera, mut app) = pair();
+        let (mut app2, mut app3) = pair_with_two_more_apps(&mut camera, &mut app);
+
+        // Create input thumbnail file to be encrypted (all 0's)
+        let thumbnail_pathname = "test_data/thumbnail_file";
+        let file_size: usize = 1069;
+
+        generate_dummy_file(thumbnail_pathname, file_size);
+
+        // Camera encrypts thumbnail file
+        let enc_thumbnail_pathname = "test_data/enc_thumbnail_file";
+        let mut thumbnail_info =
+                    ThumbnailMetaInfo::new(0, 0, vec![]);
+
+        encrypt_thumbnail_file(
+            &mut camera,
+            thumbnail_pathname,
+            enc_thumbnail_pathname,
+            &mut thumbnail_info,
+        ).unwrap();
+
+        let mut apps = [
+            (&mut app, "app"),
+            (&mut app2, "app2"),
+            (&mut app3, "app3"),
+        ];
+
+        for (app, name) in apps.iter_mut() {
+            // App decrypts thumbnail file
+            let dir = format!("test_data/{}/videos", name);
+            fs::create_dir(&dir).unwrap();
+
+            let dec_thumbnail_filename = decrypt_thumbnail_file(
+                *app,
+                enc_thumbnail_pathname,
+                "test_data",
+            ).unwrap();
+
+            let dec_thumbnail_pathname = format!("{}/{}", dir, dec_thumbnail_filename);
+
+            // Check decrypted file
+            check_decrypted_dummy_file(&dec_thumbnail_pathname, file_size);
+        }
+    }
+
+    #[test]
+    /// Camera invites three apps.
+    /// All apps then send update proposals.
+    /// Camera receives those proposals and
+    /// then sends a thumbnail to all of them.
+    fn camera_to_more_apps_update_thumbnail_test() {
+        let (mut camera, mut app) = pair();
+        let (mut app2, mut app3) = pair_with_two_more_apps(&mut camera, &mut app);
+
+        let apps = [&mut app, &mut app2, &mut app3];
+
+        for app in apps {
+            // App generates an update proposal
+            let update_proposal = app.update_proposal().unwrap();
+            app.save_group_state().unwrap();
+
+            // Camera receives it
+            camera.decrypt(update_proposal, false).unwrap();
+            camera.save_group_state().unwrap();
+        }
+
+        // Create input thumbnail file to be encrypted (all 0's)
+        let thumbnail_pathname = "test_data/thumbnail_file";
+        let file_size: usize = 1069;
+
+        generate_dummy_file(thumbnail_pathname, file_size);
+
+        // Camera encrypts thumbnail file
+        let enc_thumbnail_pathname = "test_data/enc_thumbnail_file";
+        let mut thumbnail_info =
+                    ThumbnailMetaInfo::new(0, 0, vec![]);
+
+        encrypt_thumbnail_file(
+            &mut camera,
+            thumbnail_pathname,
+            enc_thumbnail_pathname,
+            &mut thumbnail_info,
+        ).unwrap();
+
+        let mut apps = [
+            (&mut app, "app"),
+            (&mut app2, "app2"),
+            (&mut app3, "app3"),
+        ];
+
+        for (app, name) in apps.iter_mut() {
+            // App decrypts thumbnail file
+            let dir = format!("test_data/{}/videos", name);
+            fs::create_dir(&dir).unwrap();
+
+            let dec_thumbnail_filename = decrypt_thumbnail_file(
+                *app,
+                enc_thumbnail_pathname,
+                "test_data",
+            ).unwrap();
+
+            let dec_thumbnail_pathname = format!("{}/{}", dir, dec_thumbnail_filename);
+
+            // Check decrypted file
+            check_decrypted_dummy_file(&dec_thumbnail_pathname, file_size);
+        }
+    }
 }

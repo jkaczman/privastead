@@ -13,7 +13,9 @@ use docopt::Docopt;
 use secluso_client_lib::http_client::HttpClient;
 use secluso_client_lib::mls_client::{ClientType, MlsClient};
 use secluso_client_lib::mls_clients::{
-    MlsClients, CONFIG, FCM, LIVESTREAM, MLS_CLIENT_TAGS, MOTION, NUM_MLS_CLIENTS, THUMBNAIL,
+    MlsClients, FCM, MLS_CLIENT_TAGS, MOTION, NUM_MLS_CLIENTS,
+    THUMBNAIL, LIVESTREAM_DED, CONFIG_DED,
+    MlsClientsCommon, MlsClientsDedicated,
 };
 use secluso_client_lib::thumbnail_meta_info::ThumbnailMetaInfo;
 use std::array;
@@ -36,8 +38,8 @@ use crate::delivery_monitor::{DeliveryMonitor, VideoInfo};
 mod motion;
 
 use crate::motion::{
-    prepare_motion_thumbnail, prepare_motion_video, send_pending_motion_videos,
-    send_pending_thumbnails, upload_pending_enc_thumbnails, upload_pending_enc_videos,
+    prepare_motion_thumbnail, prepare_motion_video,
+    upload_pending_enc_thumbnails, upload_pending_enc_videos,
 };
 
 mod livestream;
@@ -77,8 +79,11 @@ cfg_if! {
     } else if #[cfg(feature = "ip")] {
         mod ip;
         use crate::ip::ip_camera::IpCamera;
+    } else if #[cfg(feature = "test")] {
+        mod test_camera;
+        use crate::test_camera::TestCamera;
     } else {
-        compile_error!("One of the features 'manual', 'raspberry', or 'ip' must be enabled.");
+        compile_error!("One of the features 'manual', 'raspberry', 'ip', or 'test' must be enabled.");
     }
 }
 
@@ -96,16 +101,12 @@ Usage:
   secluso-camera-hub [--save-all]
   secluso-camera-hub [--save-all] --reset
   secluso-camera-hub [--save-all] --reset-full
-  secluso-camera-hub [--save-all] --test-motion
-  secluso-camera-hub [--save-all] --test-livestream
   secluso-camera-hub (--version | -v)
   secluso-camera-hub (--help | -h)
 
 Options:
     --reset             Wipe all the state, but not pending videos
     --reset-full        Wipe all the state and pending videos
-    --test-motion       Used for testing motion videos
-    --test-livestream   Used for testing video livestreaming
     --save-all          Save all telemetry events, not just human detections
     --version, -v       Show version
     --help, -h          Show help
@@ -115,11 +116,8 @@ Options:
 struct Args {
     flag_reset: bool,
     flag_reset_full: bool,
-    flag_test_motion: bool,
     #[cfg(feature = "raspberry")]
     flag_save_all: bool,
-    #[cfg(feature = "ip")]
-    flag_test_livestream: bool,
 }
 
 fn main() -> io::Result<()> {
@@ -177,19 +175,28 @@ fn main() -> io::Result<()> {
             // list of cameras here.
             let camera_list: Vec<Box<dyn Camera + Send>> =
                 IpCamera::get_all_cameras_info()?;
-            let input_camera_secret: Option<Vec<u8>> = if args.flag_test_motion || args.flag_test_livestream {
-                Some(get_input_camera_secret())
-            } else {
-                // This means that the hub generates a new secret. This is usable when the user can
-                // access the generated secret file in order to scan it in the app.
-                // That is the case when using a hub with IP cameras, but not in the case of the
-                // Raspberry Pi camera.
-                None
-            };
+            // This means that the hub generates a new secret. This is usable when the user can
+            // access the generated secret file in order to scan it in the app.
+            // That is the case when using a hub with IP cameras, but not in the case of the
+            // Raspberry Pi camera.
+            let input_camera_secret: Option<Vec<u8>> = None;
 
             let connect_to_wifi = false;
+        } else if #[cfg(feature = "test")] {
+            let camera = TestCamera {
+                name: "TestCamera".to_string(),
+                state_dir: STATE_DIR_GENERAL.to_string(),
+                video_dir: VIDEO_DIR_GENERAL.to_string(),
+                thumbnail_dir: THUMBNAIL_DIR_GENERAL.to_string(),
+                counter: 15,
+            };
+
+            let camera_list: Vec<Box<dyn Camera + Send>> = vec![Box::new(camera)];
+
+            let input_camera_secret = Some(get_input_camera_secret());
+            let connect_to_wifi = false;
         } else {
-            compile_error!("One of the features 'manual', 'raspberry', or 'ip' must be enabled.");
+            compile_error!("One of the features 'manual', 'raspberry', 'ip', or 'test' must be enabled.");
         }
     }
 
@@ -225,7 +232,6 @@ fn main() -> io::Result<()> {
                     camera.as_mut(),
                     input_camera_secret.clone(),
                     connect_to_wifi,
-                    args.flag_test_motion,
                 ) {
                     Ok(_) => {}
                     Err(e) => {
@@ -259,7 +265,7 @@ fn reset(camera: &dyn Camera, reset_full: bool) -> io::Result<()> {
 
     for tag in MLS_CLIENT_TAGS.iter().take(NUM_MLS_CLIENTS) {
         let (camera_name, group_name) = get_names(
-            camera,
+            camera.get_state_dir(),
             first_time,
             format!("camera_{}_name", tag),
             format!("group_{}_name", tag),
@@ -327,7 +333,7 @@ fn reset(camera: &dyn Camera, reset_full: bool) -> io::Result<()> {
 pub fn initialize_mls_clients(camera: &dyn Camera, first_time: bool) -> MlsClients {
     array::from_fn(|i| {
         let (camera_name, group_name) = get_names(
-            camera,
+            camera.get_state_dir(),
             first_time,
             format!("camera_{}_name", MLS_CLIENT_TAGS[i]),
             format!("group_{}_name", MLS_CLIENT_TAGS[i]),
@@ -355,11 +361,15 @@ pub fn initialize_mls_clients(camera: &dyn Camera, first_time: bool) -> MlsClien
     })
 }
 
+fn split_clients(clients: MlsClients) -> (MlsClientsCommon, MlsClientsDedicated) {
+    let [c0, c1, c2, d0, d1] = clients;
+    ([c0, c1, c2], [d0, d1])
+}
+
 fn core(
     camera: &mut dyn Camera,
     input_camera_secret: Option<Vec<u8>>,
     connect_to_wifi: bool,
-    test_mode: bool,
 ) -> anyhow::Result<()> {
     let state_dir = camera.get_state_dir();
     let first_time: bool = !Path::new(&(state_dir.clone() + "/first_time_done")).exists();
@@ -385,6 +395,8 @@ fn core(
         println!("[{}] Pairing successful.", camera_name);
     }
 
+    let (mut clients_com, mut clients_ded_primary) = split_clients(clients);
+
     println!("[{}] Running...", camera_name);
 
     let (server_username, server_password, server_addr) = read_parse_full_credentials();
@@ -398,22 +410,24 @@ fn core(
     let thumbnail_dir = camera.get_thumbnail_dir();
     let mut delivery_monitor =
         DeliveryMonitor::from_file_or_new(video_dir, thumbnail_dir, state_dir.clone());
-    let livestream_request = Arc::new(Mutex::new(false));
+    let livestream_request = Arc::new(Mutex::new((false, true)));
     let livestream_request_clone = Arc::clone(&livestream_request);
-    let group_livestream_name_clone = clients[LIVESTREAM].get_group_name().unwrap();
+    let group_livestream_name_clone = clients_ded_primary[LIVESTREAM_DED].get_group_name().unwrap();
     let http_client_clone = http_client.clone();
-    let group_config_name_clone = clients[CONFIG].get_group_name().unwrap();
+    let group_config_name_clone = clients_ded_primary[CONFIG_DED].get_group_name().unwrap();
     let http_client_clone_2 = http_client.clone();
-    let config_enc_commands: Arc<Mutex<Vec<Vec<u8>>>> = Arc::new(Mutex::new(vec![]));
+    let config_enc_commands: Arc<Mutex<Vec<(Vec<u8>, bool)>>> = Arc::new(Mutex::new(vec![]));
     let config_enc_commands_clone = Arc::clone(&config_enc_commands);
+    let clients_ded_secondary: Arc<Mutex<Option<MlsClientsDedicated>>> = Arc::new(Mutex::new(None));
 
     thread::spawn(move || loop {
         if http_client_clone
             .livestream_check(&group_livestream_name_clone)
             .is_ok()
         {
+            println!("Livestream1 detected");
             let mut check = livestream_request_clone.lock().unwrap();
-            *check = true;
+            *check = (true, true);  // second true -> livestream command from the primary app
         } else {
             sleep(Duration::from_secs(1));
         }
@@ -422,22 +436,12 @@ fn core(
     thread::spawn(move || loop {
         if let Ok(enc_command) = http_client_clone_2.config_check(&group_config_name_clone) {
             let mut config_enc_commands = config_enc_commands_clone.lock().unwrap();
-            config_enc_commands.push(enc_command);
+            config_enc_commands.push((enc_command, true)); // true -> config command from the primary app
         } else {
             error!("Error in receiving config command");
             sleep(Duration::from_secs(1));
         }
     });
-
-    if first_time {
-        // Send pending videos before entering the loop
-        // This is needed after re-pairing.
-        // For now, re-pairing is done manually and needs physical proximity.
-        // Hence, it is safe to send pending videos to the app that is paired with the camera.
-        let _ =
-            send_pending_motion_videos(camera, &mut clients, &mut delivery_monitor, &http_client);
-        let _ = send_pending_thumbnails(camera, &mut clients, &mut delivery_monitor, &http_client);
-    }
 
     // Used for anti-dither for motion detection
     loop {
@@ -450,16 +454,23 @@ fn core(
             }
         };
 
-        //debug!("Motion event: {}", motion_event.0);
+        debug!("Motion event: {}", motion_event.0);
 
         // Send motion events only if we haven't sent one in the past minute
-        if (motion_event.motion || test_mode)
+        if (motion_event.motion)
             && (locked_motion_check_time.is_none()
                 || locked_motion_check_time.unwrap().le(&Instant::now()))
         {
             let video_info = VideoInfo::new();
             let motion_timestamp = video_info.timestamp;
             println!("Detected motion.");
+
+            let clients_ded_sec_opt = clients_ded_secondary.lock().unwrap();
+            let num_apps = if clients_ded_sec_opt.is_some() {
+                2
+            } else {
+                1
+            };
 
             // We send the thumbnail BEFORE the FCM notification, to ensure that when the mobile app receives it, it can download it.
             if let Some(thumbnail_image) = motion_event.thumbnail {
@@ -473,67 +484,65 @@ fn core(
                     .expect("Failed to save thumbnail PNG file");
 
                 prepare_motion_thumbnail(
-                    &mut clients[THUMBNAIL],
+                    &mut clients_com[THUMBNAIL],
                     thumbnail_info,
                     &mut delivery_monitor,
                 )?;
 
                 info!("Uploading the encrypted thumbnail.");
                 let _ = upload_pending_enc_thumbnails(
-                    &clients[THUMBNAIL].get_group_name().unwrap(),
+                    &clients_com[THUMBNAIL].get_group_name().unwrap(),
                     &mut delivery_monitor,
                     &http_client,
+                    num_apps,
                 );
             }
 
-            if !test_mode {
-                let state_dir_ref = state_dir.as_str();
-                info!("Sending the motion notification with timestamp.");
-                let notification_msg = clients[FCM]
-                    .encrypt(&bincode::serialize(&motion_timestamp).unwrap())?;
-                clients[FCM].save_group_state().unwrap();
-                match send_notification(state_dir_ref, &http_client, notification_msg) {
-                    Ok(_) => {}
-                    Err(e) => {
-                        error!("Failed to send motion notification ({})", e);
-                    }
+            let state_dir_ref = state_dir.as_str();
+            info!("Sending the motion notification with timestamp.");
+            let notification_msg =
+                clients_com[FCM].encrypt(&bincode::serialize(&motion_timestamp).unwrap())?;
+            clients_com[FCM].save_group_state().unwrap();
+            match send_notification(state_dir_ref, &http_client, notification_msg) {
+                Ok(_) => {}
+                Err(e) => {
+                    error!("Failed to send motion notification ({})", e);
                 }
             }
 
             info!("Starting to record, prepare, and encrypt video.");
-            let duration = if test_mode { 1 } else { 20 };
+            let duration = 20;
 
             camera.record_motion_video(&video_info, duration)?;
-            prepare_motion_video(&mut clients[MOTION], video_info, &mut delivery_monitor)?;
+            prepare_motion_video(&mut clients_com[MOTION], video_info, &mut delivery_monitor)?;
 
             info!("Uploading the encrypted video.");
             let _ = upload_pending_enc_videos(
-                &clients[MOTION].get_group_name().unwrap(),
+                &clients_com[MOTION].get_group_name().unwrap(),
                 &mut delivery_monitor,
                 &http_client,
+                num_apps,
             );
 
-            if !test_mode {
-                let state_dir_ref = state_dir.as_str();
-                let target =
-                    notification_target::refresh_notification_target(state_dir_ref, &http_client);
-                let platform_label = target
-                    .as_ref()
-                    .map(|target| target.platform.as_str())
-                    .unwrap_or("fcm");
-                info!(
-                    "Sending the post-upload notification to start downloading over {}.",
-                    platform_label
-                );
-                let notification_timestamp: u64 = 0;
-                let notification_msg = clients[FCM]
-                    .encrypt(&bincode::serialize(&notification_timestamp).unwrap())?;
-                clients[FCM].save_group_state().unwrap();
-                match send_notification(state_dir_ref, &http_client, notification_msg) {
-                    Ok(_) => {}
-                    Err(e) => {
-                        error!("Failed to send motion notification ({})", e);
-                    }
+            let state_dir_ref = state_dir.as_str();
+            let target =
+                notification_target::refresh_notification_target(state_dir_ref, &http_client);
+            let platform_label = target
+                .as_ref()
+                .map(|target| target.platform.as_str())
+                .unwrap_or("fcm");
+            info!(
+                "Sending the post-upload notification to start downloading over {}.",
+                platform_label
+            );
+            let notification_timestamp: u64 = 0;
+            let notification_msg = clients_com[FCM]
+                .encrypt(&bincode::serialize(&notification_timestamp).unwrap())?;
+            clients_com[FCM].save_group_state().unwrap();
+            match send_notification(state_dir_ref, &http_client, notification_msg) {
+                Ok(_) => {}
+                Err(e) => {
+                    error!("Failed to send motion notification ({})", e);
                 }
             }
 
@@ -547,16 +556,28 @@ fn core(
         {
             // Livestream request? Start it.
             let mut check = livestream_request.lock().unwrap();
-            if *check {
+            let primary_app = check.1;
+            if check.0 {
                 info!("Livestream start detected");
-                *check = false;
-                if let Err(e) = livestream(
-                    &mut clients[LIVESTREAM],
-                    camera,
-                    &mut delivery_monitor,
-                    &http_client,
-                ) {
-                    error!("Livestream returned error: {e}");
+                *check = (false, false);
+                if primary_app {
+                    livestream(
+                        &mut clients_ded_primary[LIVESTREAM_DED],
+                        camera,
+                        &mut delivery_monitor,
+                        &http_client,
+                    )?;
+                } else {
+                    let mut clients_ded_sec_opt = clients_ded_secondary.lock().unwrap();
+                    if let Some(ref mut clients_ded_sec) = *clients_ded_sec_opt { // Should always be the case if we get here
+                        livestream(
+                            &mut clients_ded_sec[LIVESTREAM_DED],
+                            camera,
+                            // FIXME: delivery_monitor should use a separate queue for app2
+                            &mut delivery_monitor,
+                            &http_client,
+                        )?;
+                    }
                 }
             }
 
@@ -567,10 +588,18 @@ fn core(
         if locked_delivery_check_time.is_none()
             || locked_delivery_check_time.unwrap().le(&Instant::now())
         {
+            let clients_ded_sec_opt = clients_ded_secondary.lock().unwrap();
+            let num_apps = if clients_ded_sec_opt.is_some() {
+                2
+            } else {
+                1
+            };
+
             if upload_pending_enc_videos(
-                &clients[MOTION].get_group_name().unwrap(),
+                &clients_com[MOTION].get_group_name().unwrap(),
                 &mut delivery_monitor,
                 &http_client,
+                num_apps,
             )
             .is_ok()
             {
@@ -584,9 +613,10 @@ fn core(
             }
 
             if upload_pending_enc_thumbnails(
-                &clients[THUMBNAIL].get_group_name().unwrap(),
+                &clients_com[THUMBNAIL].get_group_name().unwrap(),
                 &mut delivery_monitor,
                 &http_client,
+                num_apps,
             )
             .is_ok()
             {
@@ -604,13 +634,72 @@ fn core(
         {
             let mut enc_commands = config_enc_commands.lock().unwrap();
             for enc_command in &*enc_commands {
-                if let Err(e) = process_config_command(
-                    &mut clients,
-                    enc_command,
-                    &http_client,
-                    &mut delivery_monitor,
-                ) {
-                    info!("process_confg_command returned error - {e}");
+                let primary_app = enc_command.1;
+
+                if primary_app {
+                    println!("About to call process_config_command for primary app");
+                    let mut clients_ded_sec_opt = clients_ded_secondary.lock().unwrap();
+                    let process_ret = process_config_command(
+                        &mut clients_com,
+                        &mut clients_ded_primary,
+                        &enc_command.0,
+                        &http_client,
+                        // TODO: We only keep track of video delivery to the primary app for now.
+                        Some(&mut delivery_monitor),
+                        true,
+                        clients_ded_sec_opt.is_some(),
+                    )?;
+
+                    if clients_ded_sec_opt.is_none() {
+                        *clients_ded_sec_opt = process_ret;
+
+                        if let Some(ref clients_ded_sec) = *clients_ded_sec_opt {
+                            println!("Launching threads for the second app.");
+                            let group_livestream2_name_clone = clients_ded_sec[LIVESTREAM_DED].get_group_name()?;
+                            let livestream_request_clone_2 = Arc::clone(&livestream_request);
+                            let http_client_clone_3 = http_client.clone();
+                            let group_config2_name_clone = clients_ded_sec[CONFIG_DED].get_group_name()?;
+                            let http_client_clone_4 = http_client.clone();
+                            let config_enc_commands_clone_2 = Arc::clone(&config_enc_commands);
+
+                            thread::spawn(move || loop {
+                                if http_client_clone_3
+                                    .livestream_check(&group_livestream2_name_clone)
+                                    .is_ok()
+                                {
+                                    println!("Livestream2 detected");
+                                    let mut check = livestream_request_clone_2.lock().unwrap();
+                                    *check = (true, false); // false -> livestream command from the secondary app
+                                } else {
+                                    sleep(Duration::from_secs(1));
+                                }
+                            });
+
+                            thread::spawn(move || loop {
+                                if let Ok(enc_command) = http_client_clone_4.config_check(&group_config2_name_clone) {
+                                    let mut config_enc_commands = config_enc_commands_clone_2.lock().unwrap();
+                                    config_enc_commands.push((enc_command, false)); // false -> config command from the secondary app
+                                } else {
+                                    error!("Error in receiving config command");
+                                    sleep(Duration::from_secs(1));
+                                }
+                            });
+                        }
+                    }
+                } else {
+                    println!("About to call process_config_command for secondary app");
+                    let mut clients_ded_sec_opt = clients_ded_secondary.lock().unwrap();
+                    if let Some(ref mut clients_ded_sec) = *clients_ded_sec_opt {
+                        let _ = process_config_command(
+                            &mut clients_com,
+                            clients_ded_sec, // Will not be None if we get here
+                            &enc_command.0,
+                            &http_client,
+                            None,
+                            false,
+                            true,
+                        )?;
+                    }
                 }
             }
             enc_commands.clear();

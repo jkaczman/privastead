@@ -258,16 +258,16 @@ impl MlsClient {
 
         let group = self.group.as_mut().unwrap();
 
-        // first is true if we're inviting the first app, i.e., the admin_app
-        let first = group.contacts.len() == 0;
-
         #[cfg(not(test))] {
-            // For now, we allow one app only.
+            // For now, we allow two apps only.
             // We allow more apps for tests.
-            if !first {
-                return Err(io::Error::other("The camera can invite one app only (for now)."));
+            if group.contacts.len() >= 2 {
+                return Err(io::Error::other("Cannot invite more than two apps".to_string()));
             }
         }
+
+        // first is true if we're inviting the first app, i.e., the admin_app
+        let first = group.contacts.len() == 0;
 
         if !first {
             // Set AAD for the commit message
@@ -779,6 +779,33 @@ impl MlsClient {
         })?;
 
         Ok(msg_vec)
+    }
+
+    pub fn get_update_proposals(&self) -> io::Result<Vec<QueuedProposal>> {
+        let mut proposals: Vec<QueuedProposal> = vec![];
+
+        let group = self.group.as_ref().unwrap();
+
+        for contact in &group.contacts {
+            if let Some(proposal) = &contact.update_proposal {
+                proposals.push(proposal.clone());
+            }
+        }
+
+        Ok(proposals)
+    }
+
+    pub fn store_update_proposals(&mut self, proposals: Vec<QueuedProposal>) -> io::Result<()> {
+        let group = self.group.as_mut().unwrap();
+
+        for proposal in proposals {
+            group
+                .mls_group
+                .store_pending_proposal(self.provider.storage(), proposal)
+                .map_err(|e| io::Error::other(format!("Error: could not store proposal - {e}")))?;
+        }
+
+        Ok(())
     }
 
     /// Get the current group epoch

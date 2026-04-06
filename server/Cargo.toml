@@ -20,3 +20,4 @@ plist = "1.8.0"
 anyhow = "1.0.102"
 secluso-server-backbone = { path = "../server_backbone" }
 web-push = "0.11.0"
+once_cell = "1"

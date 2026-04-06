@@ -227,14 +227,14 @@ impl HttpClient {
     }
 
     /// Uploads an (encrypted) file.
-    pub fn upload_enc_file(&self, group_name: &str, enc_file_path: &Path) -> io::Result<()> {
+    pub fn upload_enc_file(&self, group_name: &str, enc_file_path: &Path, num_apps: u32) -> io::Result<()> {
         let enc_file_name = enc_file_path
             .file_name()
             .and_then(|name| name.to_str())
             .unwrap()
             .to_string();
 
-        let server_url = format!("{}/{}/{}", self.server_addr, group_name, enc_file_name);
+        let server_url = format!("{}/{}/{}/{}", self.server_addr, group_name, enc_file_name, num_apps);
 
         let file = File::open(enc_file_path)?;
         let reader = BufReader::new(file);
@@ -261,8 +261,8 @@ impl HttpClient {
         Ok(())
     }
 
-    /// Fetches an (encrypted) video file, persists it, and then deletes it from the server.
-    pub fn fetch_enc_video(&self, group_name: &str, enc_file_path: &Path) -> io::Result<()> {
+    /// Fetches an (encrypted) video file or thumbnail, persists it, and then deletes it from the server.
+    pub fn fetch_enc_file(&self, group_name: &str, enc_file_path: &Path) -> io::Result<()> {
         let enc_file_name = enc_file_path
             .file_name()
             .and_then(|name| name.to_str())

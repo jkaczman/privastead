@@ -11,6 +11,7 @@ ip = ["dep:rpassword", "dep:reqwest", "dep:http-auth", "dep:linfa", "dep:linfa-c
 raspberry = ["dep:secluso-motion-ai"]
 manual = []
 telemetry = [] # todo: dep on the motion_ai crate
+test = []
 
 [dependencies]
 docopt = "~1.1"

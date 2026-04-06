@@ -3,6 +3,7 @@ use std::io::{self, Read, Write, BufRead, BufReader, BufWriter};
 use std::time::Instant;
 use std::path::Path;
 use log::{debug, info, error};
+use openmls::prelude::QueuedProposal;
 use crate::mls_client::MlsClient;
 use crate::video_net_info::{VideoNetInfo, VIDEONETINFO_SANITY};
 use crate::thumbnail_meta_info::{ThumbnailMetaInfo, THUMBNAIL_SANITY};
@@ -16,14 +17,22 @@ pub fn decrypt_video_file(
     info!("File dir: {}", file_dir);
     let mut enc_file = File::open(enc_pathname).expect("Could not open encrypted file");
 
-    let enc_msg = read_next_msg_from_file(&mut enc_file)?;
-    // The first message is a commit message
+    // The first message is a vec of update proposals (which could be empty)
+    let msg = read_next_msg_from_file(&mut enc_file)?;
+    let proposals_start = Instant::now();
+    let update_proposals: Vec<QueuedProposal> = bincode::deserialize(&msg)
+        .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))?;
+    motion_mls_client.store_update_proposals(update_proposals)?;
+    let proposals_ms = proposals_start.elapsed().as_millis();
+
+    let msg = read_next_msg_from_file(&mut enc_file)?;
+    // The second message is the commit message
     let commit_start = Instant::now();
-    motion_mls_client.decrypt(enc_msg, false)?;
+    motion_mls_client.decrypt(msg, false)?;
     let commit_ms = commit_start.elapsed().as_millis();
 
     let enc_msg = read_next_msg_from_file(&mut enc_file)?;
-    // The second message is the video info
+    // The third message is the video info
     let info_start = Instant::now();
     let dec_msg = motion_mls_client.decrypt(enc_msg, true)?;
     let info_ms = info_start.elapsed().as_millis();
@@ -101,7 +110,8 @@ pub fn decrypt_video_file(
     let flush_ms = flush_start.elapsed().as_millis();
 
     debug!(
-        "decrypt_video timings: commit={}ms info={}ms chunks={}ms flush={}ms total={}ms (chunks={})",
+        "decrypt_video timings: proposals={}ms commit={}ms info={}ms chunks={}ms flush={}ms total={}ms (chunks={})",
+        proposals_ms,
         commit_ms,
         info_ms,
         chunk_ms,
@@ -124,14 +134,22 @@ pub fn decrypt_thumbnail_file(
 
     let mut enc_file = File::open(enc_pathname).expect("Could not open encrypted file");
 
-    let enc_msg = read_next_msg_from_file(&mut enc_file)?;
-    // The first message is a commit message
+    // The first message is a vec of update proposals (which could be empty)
+    let msg = read_next_msg_from_file(&mut enc_file)?;
+    let proposals_start = Instant::now();
+    let update_proposals: Vec<QueuedProposal> = bincode::deserialize(&msg)
+        .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))?;
+    thumbnail_mls_client.store_update_proposals(update_proposals)?;
+    let proposals_ms = proposals_start.elapsed().as_millis();
+
+    let msg = read_next_msg_from_file(&mut enc_file)?;
+    // The second message is a commit message
     let commit_start = Instant::now();
-    thumbnail_mls_client.decrypt(enc_msg, false)?;
+    thumbnail_mls_client.decrypt(msg, false)?;
     let commit_ms = commit_start.elapsed().as_millis();
 
     let enc_msg = read_next_msg_from_file(&mut enc_file)?;
-    // The second message is the timestamp
+    // The third message is the timestamp
     let meta_start = Instant::now();
     let dec_msg = thumbnail_mls_client.decrypt(enc_msg, true)?;
     let meta_ms = meta_start.elapsed().as_millis();
@@ -156,7 +174,8 @@ pub fn decrypt_thumbnail_file(
     if Path::new(&dec_pathname).exists() {
         // TODO: Should this be an error?
         debug!(
-            "decrypt_thumbnail timings (duplicate): commit={}ms meta={}ms total={}ms",
+            "decrypt_thumbnail timings (duplicate): proposals={}ms commit={}ms meta={}ms total={}ms",
+            proposals_ms,
             commit_ms,
             meta_ms,
             total_start.elapsed().as_millis()
@@ -236,10 +255,14 @@ pub fn encrypt_video_file(
     timestamp: u64,
 ) -> io::Result<u64> {
     debug!("Starting to encrypt video.");
-    let (commit_msg, epoch) = motion_mls_client.update()?;
-    
     let mut enc_file =
         File::create(&enc_pathname).expect("Could not create encrypted video file");
+
+    let update_proposals = motion_mls_client.get_update_proposals()?;
+    let update_proposals_msg = bincode::serialize(&update_proposals).unwrap();
+    append_to_file(&enc_file, update_proposals_msg);
+
+    let (commit_msg, epoch) = motion_mls_client.update()?;
 
     append_to_file(&enc_file, commit_msg);
 
@@ -299,11 +322,15 @@ pub fn encrypt_thumbnail_file(
     thumbnail_info: &mut ThumbnailMetaInfo,
 ) -> io::Result<u64> {
     debug!("Starting to encrypt thumbnail.");
-    // Update MLS epoch
-    let (commit_msg, thumbnail_epoch) = thumbnail_mls_client.update()?;
-
     let mut enc_file =
         File::create(&enc_pathname).expect("Could not create encrypted video file");
+
+    let update_proposals = thumbnail_mls_client.get_update_proposals()?;
+    let update_proposals_msg = bincode::serialize(&update_proposals).unwrap();
+    append_to_file(&enc_file, update_proposals_msg);
+
+    // Update MLS epoch
+    let (commit_msg, thumbnail_epoch) = thumbnail_mls_client.update()?;
 
     append_to_file(&enc_file, commit_msg);
 

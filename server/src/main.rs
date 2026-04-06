@@ -9,8 +9,10 @@ extern crate rocket;
 
 use std::collections::HashMap;
 use std::io;
+use std::io::ErrorKind;
 use std::path::Path;
 use std::time::{Duration, UNIX_EPOCH};
+use once_cell::sync::Lazy;
 
 use base64::engine::general_purpose::STANDARD as base64_engine;
 use base64::Engine;
@@ -29,6 +31,7 @@ use rocket::tokio::sync::Notify;
 use rocket::tokio::task;
 use rocket::tokio::time::timeout;
 use rocket::{Request, Response, Shutdown, tokio};
+use rocket::tokio::sync::{Mutex as AsyncMutex};
 use secluso_server_backbone::types::{
     ConfigResponse, GroupTimestamp, MotionPairs, PairingRequest, PairingResponse, ServerStatus,
     NotificationTarget,
@@ -95,7 +98,7 @@ const MAX_MOTION_FILE_SIZE: usize = 50; // in mebibytes
 const MAX_NUM_PENDING_MOTION_FILES: usize = 100;
 const MAX_LIVESTREAM_FILE_SIZE: usize = 20; // in mebibytes
 const MAX_NUM_PENDING_LIVESTREAM_FILES: usize = 50;
-const MAX_COMMAND_FILE_SIZE: usize = 10; // in kibibytes
+const MAX_COMMAND_FILE_SIZE: usize = 100; // in kibibytes
 
 async fn get_num_files(path: &Path) -> io::Result<usize> {
     let mut entries = fs::read_dir(path).await?;
@@ -320,13 +323,19 @@ async fn pair(
     }
 }
 
-#[post("/<camera>/<filename>", data = "<data>")]
+#[post("/<camera>/<filename>/<counter>", data = "<data>")]
 async fn upload(
     camera: &str,
     filename: &str,
+    counter: u32,
     data: Data<'_>,
     auth: BasicAuth,
 ) -> io::Result<String> {
+    // Validate counter (must be 1 or 2)
+    if counter == 0 || counter > 2 {
+        return Err(io::Error::other("counter must be 1 or 2"));
+    }
+
     let root = Path::new("data").join(&auth.username);
     let camera_path = root.join(camera);
     check_path_sandboxed(&root, &camera_path)?;
@@ -340,23 +349,32 @@ async fn upload(
         return Err(io::Error::other("Error: Reached max motion pending limit."));
     }
 
-    let filepath = Path::new(&camera_path).join(filename);
+    let filepath = camera_path.join(filename);
     check_path_sandboxed(&root, &filepath)?;
 
-    let filepath_tmp = Path::new(&camera_path).join(format!("{}_tmp", filename));
+    let filepath_tmp = camera_path.join(format!("{}_tmp", filename));
     check_path_sandboxed(&root, &filepath_tmp)?;
+
+    let refcount_path = camera_path.join(format!(".{}.refcount", filename));
+    check_path_sandboxed(&root, &refcount_path)?;
+
+    let refcount_tmp_path = camera_path.join(format!(".{}.refcount_tmp", filename));
+    check_path_sandboxed(&root, &refcount_tmp_path)?;
 
     let mut file = fs::File::create(&filepath_tmp).await?;
     let mut stream = data.open(MAX_MOTION_FILE_SIZE.mebibytes());
     tokio::io::copy(&mut stream, &mut file).await?;
-    // Flush the file to disk
     file.sync_all().await?;
 
     // We write to a temp file first and then rename to avoid a race with the retrieve operation.
-    fs::rename(filepath_tmp, filepath).await?;
+    fs::rename(&filepath_tmp, &filepath).await?;
+
+    // Write refcount atomically
+    fs::write(&refcount_tmp_path, counter.to_string()).await?;
+    fs::rename(&refcount_tmp_path, &refcount_path).await?;
 
     // Flush the directory entry metadata to disk
-    let camera_dir = File::open(camera_path).await?;
+    let camera_dir = File::open(&camera_path).await?;
     camera_dir.sync_all().await?;
 
     Ok("ok".to_string())
@@ -420,10 +438,29 @@ async fn retrieve(camera: &str, filename: &str, auth: BasicAuth) -> Option<RawTe
     File::open(filepath).await.map(RawText).ok()
 }
 
+static FILE_LOCKS: Lazy<AsyncMutex<HashMap<String, Arc<AsyncMutex<()>>>>> =
+    Lazy::new(|| AsyncMutex::new(HashMap::new()));
+
+async fn get_file_lock(camera: String) -> Arc<AsyncMutex<()>> {
+    let mut locks = FILE_LOCKS.lock().await;
+    locks
+        .entry(camera)
+        .or_insert_with(|| Arc::new(AsyncMutex::new(())))
+        .clone()
+}
+
+async fn remove_file_lock(
+    camera: &str,
+) { 
+    let mut map = FILE_LOCKS.lock().await;
+    map.remove(camera);
+}
+
 #[delete("/<camera>/<filename>")]
 async fn delete_file(camera: &str, filename: &str, auth: BasicAuth) -> Option<()> {
     let root = Path::new("data").join(&auth.username);
     let camera_path = root.join(camera);
+
     if check_path_sandboxed(&root, &camera_path).is_err() {
         return None;
     }
@@ -433,7 +470,51 @@ async fn delete_file(camera: &str, filename: &str, auth: BasicAuth) -> Option<()
         return None;
     }
 
-    fs::remove_file(filepath).await.ok()
+    let refcount_path = camera_path.join(format!(".{}.refcount", filename));
+    if check_path_sandboxed(&root, &refcount_path).is_err() {
+        return None;
+    }
+
+    // Two concurrent delete calls could race and we'll end
+    // up not deleting the file. That's why we need this lock.
+    let file_lock = get_file_lock(camera.to_string()).await;
+    let _guard = file_lock.lock().await;
+
+    // Read refcount (default = 1 if missing)
+    let refcount = match fs::read_to_string(&refcount_path).await {
+        Ok(contents) => contents
+            .trim()
+            .parse::<u32>()
+            .ok()
+            .filter(|v| *v >= 1)
+            .unwrap_or(1),
+        Err(e) if e.kind() == ErrorKind::NotFound => 1,
+        Err(_) => return None,
+    };
+
+    if refcount > 1 {
+        let new_refcount = refcount - 1;
+        if fs::write(&refcount_path, new_refcount.to_string())
+            .await
+            .is_err()
+        {
+            return None;
+        }
+    } else {
+        // Delete actual file
+        if fs::remove_file(&filepath).await.is_err() {
+            return None;
+        }
+
+        // Best-effort remove refcount file
+        match fs::remove_file(&refcount_path).await {
+            Ok(_) => {}
+            Err(e) if e.kind() == ErrorKind::NotFound => {}
+            Err(_) => return None,
+        }
+    }
+
+    Some(())
 }
 
 #[delete("/<camera>")]
@@ -441,6 +522,8 @@ async fn delete_camera(camera: &str, auth: BasicAuth) -> io::Result<()> {
     let root = Path::new("data").join(&auth.username);
     let camera_path = root.join(camera);
     check_path_sandboxed(&root, &camera_path)?;
+
+    remove_file_lock(camera).await;
 
     fs::remove_dir_all(camera_path).await
 }
